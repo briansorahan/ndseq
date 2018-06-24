@@ -1,9 +1,10 @@
+BIN     ?= ndseq
 LDLIBS  ?= -ljack
 SRC      = $(wildcard *.c)
 
-ndtrig   : $(SRC)
+$(BIN)   : $(SRC)
 
 clean    :
-	@rm -rf ndtrig
+	@rm -rf $(BIN)
 
-.PHONY: clean
+.PHONY   : clean
