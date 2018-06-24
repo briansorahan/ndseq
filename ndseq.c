@@ -41,11 +41,13 @@ int handle_clk_event(jack_midi_event_t event, void *ndout, void *lpout);
 int handle_launchpad_event(jack_midi_event_t event, void *ndout, void *lpout);
 
 int handle_grid_button(jack_midi_event_t midi_event, void *ndout, void *lpout);
+int handle_live_trig(jack_midi_event_t midi_event, void *ndout, void *lpout);
 int handle_letter_button(jack_midi_event_t midi_event, void *ndout, void *lpout);
 int handle_scene_button(jack_midi_event_t midi_event, void *ndout, void *lpout);
 int handle_track_button(jack_midi_event_t midi_event, void *ndout, void *lpout);
 
 int switch_mode(jack_midi_event_t midi_event, void *ndout, void *lpout);
+int set_grid_leds(void *lpout);
 int set_track_leds(void *lpout);
 int toggle_seq_step(jack_midi_event_t midi_event, void *lpout);
 	
@@ -61,6 +63,9 @@ int curr; // Current step.
 int prev; // Previous step.
 
 int mode; // UI mode (live trig or sequencer).
+
+int get_step_from(jack_midi_event_t midi_event); // Determine sequencer step based on a Launchpad grid MIDI event.
+unsigned char get_cell_from(int step); // Determine MIDI note number for the given sequencer step.
 
 int reset_launchpad(void *lpout); // Takes a JACK port buffer.
 int update_launchpad(void *lpout); // Takes a JACK port buffer.
@@ -309,14 +314,15 @@ int process(jack_nframes_t nframes, void *arg) {
 int handle_launchpad_event(jack_midi_event_t midi_event, void *ndout, void *lpout) {
 	int rc = 0;
 
-	for (size_t j = 0; j < midi_event.size; j++) {
-		if (j == 0) {
-			printf("%X", midi_event.buffer[j]);
-		} else {
-			printf(" %X", midi_event.buffer[j]);
-		}
-	}
-	printf("\n");
+	// Handy for looking at raw MIDI data.
+	/* for (size_t j = 0; j < midi_event.size; j++) { */
+	/* 	if (j == 0) { */
+	/* 		printf("%X", midi_event.buffer[j]); */
+	/* 	} else { */
+	/* 		printf(" %X", midi_event.buffer[j]); */
+	/* 	} */
+	/* } */
+	/* printf("\n"); */
 	
 	// We always expect at least 3 bytes.
 	if (midi_event.size < 3) {
@@ -339,6 +345,7 @@ int handle_launchpad_event(jack_midi_event_t midi_event, void *ndout, void *lpou
 		}
 		return rc;
 	}
+	/* printf(">>> grid button\n"); */
 	rc = handle_grid_button(midi_event, ndout, lpout);
 	if (rc != 0) {
 		fprintf(stderr, "handle grid button");
@@ -350,11 +357,14 @@ int handle_launchpad_event(jack_midi_event_t midi_event, void *ndout, void *lpou
 int handle_grid_button(jack_midi_event_t midi_event, void *ndout, void *lpout) {
 	int rc = 0;
 	
-	unsigned char ndevent[3] = {midi_event.buffer[0] + midi_event.buffer[1] - 0x70, 60, 127};
-	unsigned char lpevent[3] = {midi_event.buffer[0], midi_event.buffer[1], color(3, 0)};
-
 	switch (mode) {
 	case MODE_SEQUENCER:
+		/* printf(">>> sequencer mode\n"); */
+		
+		// Ignore button up events.
+		if (midi_event.buffer[0] == 0x80) {
+			return 0;
+		}
 		// Toggle the sequencer step for the current track.
 		rc = toggle_seq_step(midi_event, lpout);
 		if (rc != 0) {
@@ -363,18 +373,34 @@ int handle_grid_button(jack_midi_event_t midi_event, void *ndout, void *lpout) {
 		}
 		break;
 	case MODE_LIVE_TRIG:
-		rc = jack_midi_event_write(ndout, 0, ndevent, 3);
+		rc = handle_live_trig(midi_event, ndout, lpout);
 		if (rc != 0) {
-			fprintf(stderr, "error writing midi data to nord drum\n");
-			return rc;
-		}
-		rc = jack_midi_event_write(lpout, 0, lpevent, 3);
-		if (rc != 0) {
-			fprintf(stderr, "error writing midi data to nord drum\n");
+			fprintf(stderr, "handle_grid_button handling live trig");
 			return rc;
 		}
 		break;
 	}
+}
+
+int handle_live_trig(jack_midi_event_t midi_event, void *ndout, void *lpout) {
+	int rc = 0;
+
+	printf(">>> handle_live_trig track = %d, velocity = %d\n", (midi_event.buffer[1] % 8)+1, (112 - (midi_event.buffer[1] & 0xF0)) + 15);
+	
+	unsigned char ndevent[3] = {midi_event.buffer[0] + (midi_event.buffer[1] % 8), 60, (112 - (midi_event.buffer[1] & 0xF0)) + 15};
+	unsigned char lpevent[3] = {midi_event.buffer[0], midi_event.buffer[1], color(3, 0)};
+
+	rc = jack_midi_event_write(ndout, 0, ndevent, 3);
+	if (rc != 0) {
+		fprintf(stderr, "error writing midi data to nord drum\n");
+		return rc;
+	}
+	rc = jack_midi_event_write(lpout, 0, lpevent, 3);
+	if (rc != 0) {
+		fprintf(stderr, "error writing midi data to nord drum\n");
+		return rc;
+	}
+	return 0;
 }
 
 int handle_letter_button(jack_midi_event_t midi_event, void *ndout, void *lpout) {
@@ -412,6 +438,35 @@ int handle_scene_button(jack_midi_event_t midi_event, void *ndout, void *lpout) 
 }
 
 int handle_track_button(jack_midi_event_t midi_event, void *ndout, void *lpout) {
+	int rc = 0;
+
+	// Update internal state of the sequencer.
+	curr_track = midi_event.buffer[1] - 104;
+	
+	// Update the track buttons.
+	for (int i = 0; i < 6; i++) {
+		unsigned char e[3] = {0xB0, 104+i, 0};
+		if (i == curr_track) {
+			e[2] = color(3, 0);
+		}
+		rc = jack_midi_event_write(lpout, 0, e, 3);
+		if (rc != 0) {
+			fprintf(stderr, "handle_track_button updating track button");
+			return rc;
+		}
+	}
+	// Update the grid with the current track's sequencer data.
+	for (int i = 0; i < 64; i++) {
+		unsigned char e[3] = {0x90, get_cell_from(i), 0};
+		if (seqdata[curr_track][i]) {
+			e[2] = color(3, 0);
+		}
+		rc = jack_midi_event_write(lpout, 0, e, 3);
+		if (rc != 0) {
+			fprintf(stderr, "handle_track_button updating grid button");
+			return rc;
+		}
+	}
 	return 0;
 }
 
@@ -431,10 +486,9 @@ int handle_clk_event(jack_midi_event_t midi_event, void *ndout, void *lpout) {
 		}
 		break;
 	case 0xFB: // continue
-		printf("clock start 0xFB\n");
+		/* printf("clock start 0xFB\n"); */
 	case 0xFA: // start
-		printf("clock start 0xFA\n");
-		
+		/* printf("clock start 0xFA\n"); */
 		rc = start(ndout, lpout);
 		if (rc != 0) {
 			fprintf(stderr, "error starting sequencer\n");
@@ -442,19 +496,19 @@ int handle_clk_event(jack_midi_event_t midi_event, void *ndout, void *lpout) {
 		}
 		break;
 	case 0xFC: // stop
-		printf("clock stop\n");
+		/* printf("clock stop\n"); */
 		break;
 		/* case 0xF2: */
 		/* 	if (midi_event.size == 3 && midi_event.buffer[2] == 0) { */
 		/* 		printf("clock start 0xF2\n"); */
 		/* 	} */
 		/* 	break; */
-	default:
-		printf("clk event:");
-		for (size_t j = 0; j < midi_event.size; j++) {
-			printf(" %X", midi_event.buffer[j]);
-		}
-		printf("\n");
+	/* default: */
+	/* 	printf("clk event:"); */
+	/* 	for (size_t j = 0; j < midi_event.size; j++) { */
+	/* 		printf(" %X", midi_event.buffer[j]); */
+	/* 	} */
+	/* 	printf("\n"); */
 	}
 	return rc;
 }
@@ -482,8 +536,8 @@ int play(int step, void *ndout, void *lpout) {
 
 	// Play the tracks for the given step.
 	for (int i = 0; i < 6; i++) {
-		unsigned char ndevent[3] = {};
-		if (seqdata[i][curr] > 0) {
+		unsigned char ndevent[3] = {0x90+i, 60, 127};
+		if (seqdata[i][curr]) {
 			rc = jack_midi_event_write(ndout, 0, ndevent, 3);
 			if (rc != 0) {
 				fprintf(stderr, "writing MIDI data to nord drum");
@@ -505,6 +559,7 @@ int play(int step, void *ndout, void *lpout) {
 	}
 	if (curr == 0 && 0 == prev) {
 		// First time we've ever started.
+		// Assume all the sequencer data is 0, so we don't need to turn any buttons off.
 		for (int i = 0; i < 64; i++) {
 			unsigned char e[3] = {0x80, cell(i), 0};
 			rc = jack_midi_event_write(lpout, 0, e, 8);
@@ -514,8 +569,13 @@ int play(int step, void *ndout, void *lpout) {
 			}
 		}
 	} else {
+		unsigned char prev_color = 0;
+		if (seqdata[curr_track][prev]) {
+			prev_color = color(3, 0);
+		}
 		// Turn off prev.
-		unsigned char e[3] = {0x80, cell(prev), 0};
+		/* printf(">>> cell(prev) = %d\n", cell(prev)); */
+		unsigned char e[3] = {0x90, cell(prev), prev_color};
 		rc = jack_midi_event_write(lpout, 0, e, 8);
 		if (rc != 0) {
 			fprintf(stderr, "error turning off launchpad button");
@@ -557,6 +617,24 @@ int update_launchpad(void *lpout) {
 	// Set the mode LED.
 	switch (mode) {
 	case MODE_LIVE_TRIG:
+		// Turn off the grid buttons.
+		for (int i = 0; i < 64; i++) {
+			unsigned char e[3] = {0x90, get_cell_from(i), 0};
+			rc = jack_midi_event_write(lpout, 0, e, 3);
+			if (rc != 0) {
+				fprintf(stderr, "update_launchpad turning grid button off");
+				return rc;
+			}
+		}
+		// Turn off the track buttons.
+		for (int i = 0; i < 6; i++) {
+			unsigned char e[3] = {0xB0, 104+i, 0};
+			rc = jack_midi_event_write(lpout, 0, e, 3);
+			if (rc != 0) {
+				fprintf(stderr, "update_launchpad turning track button off");
+				return rc;
+			}
+		}
 		lpevent[2] = color(3, 0); // g, r
 		break;
 	case MODE_SEQUENCER:
@@ -564,6 +642,12 @@ int update_launchpad(void *lpout) {
 		rc = set_track_leds(lpout);
 		if (rc != 0) {
 			fprintf(stderr, "update_launchpad set track LED's");
+			return rc;
+		}
+		// Set the grid based on the sequencer data of the current track.
+		rc = set_grid_leds(lpout);
+		if (rc != 0) {
+			fprintf(stderr, "update_launchpad setting grid");
 			return rc;
 		}
 		lpevent[2] = color(3, 3); // g, r
@@ -580,6 +664,13 @@ int update_launchpad(void *lpout) {
 // Initializes the sequencer.
 int initialize_seq(void *lpout) {
 	int rc = 0;
+
+	// Initialize sequencer data to be all zeroes.
+	for (int i = 0; i < 6; i++) {
+		for (int j = 0; j < 64; j++) {
+			seqdata[i][j] = 0;
+		}
+	}
 
 	// Default to having the first track selected.
 	curr_track = 0;
@@ -598,16 +689,55 @@ int initialize_seq(void *lpout) {
 // get the sequencer step from a MIDI event.
 // This event should be a grid button on the launchpad.
 int get_step_from(jack_midi_event_t midi_event) {
-	return (midi_event.buffer[1] % 8) + ((midi_event.buffer[1] & 0x10) / 2);
+	return (midi_event.buffer[1] % 8) + ((midi_event.buffer[1] & 0xF0) / 2);
 }
 
+// get_cell_from gets the MIDI Note value that indicates a cell in the grid based on a step value.
+unsigned char get_cell_from(int step) {
+	return (16 * (step / 8)) + (step % 8);
+}
+
+// toggle a sequencer step based on the push of a grid button.
+// Note that we assume this is a "button down" event.
 int toggle_seq_step(jack_midi_event_t midi_event, void *lpout) {
-	/* if seqdata[curr_track][get_step_from */
+	int rc = 0;
 	int step = get_step_from(midi_event);
-	printf(">>> step %d\n", step);
+	int val = seqdata[curr_track][step];
+
+	// Set the internal state of the sequencer.
+	seqdata[curr_track][step] = !val;
+
+	unsigned char e[3] = {midi_event.buffer[0], midi_event.buffer[1], color(0, 0)};
+
+	if (seqdata[curr_track][step]) {
+		e[2] = color(3, 0);
+	}
+	rc = jack_midi_event_write(lpout, 0, e, 3);
+	if (rc != 0) {
+		fprintf(stderr, "toggling sequencer step");
+		return rc;
+	}
 	return 0;
 }
 
+int set_grid_leds(void *lpout) {
+	int rc = 0;
+	
+	for (int i = 0; i < 64; i++) {
+		unsigned char e[3] = {0x90, get_cell_from(i), 0};
+		if (seqdata[curr_track][i]) {
+			e[2] = color(3, 0);
+		}
+		rc = jack_midi_event_write(lpout, 0, e, 3);
+		if (rc != 0) {
+			fprintf(stderr, "set_grid_leds sending MIDI data to launchpad");
+			return rc;
+		}
+	}
+	return 0;
+}
+
+// Sets the track LED's based on the internal sequencer data (curr_track).
 int set_track_leds(void *lpout) {
 	int rc = 0;
 	
