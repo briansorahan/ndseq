@@ -23,12 +23,16 @@
 
 #include <jack/jack.h>
 #include <jack/midiport.h>
+#include <jack/ringbuffer.h>
 
 #define MODE_LIVE_TRIG (1)
 #define MODE_SEQUENCER (2)
 
 // Kills the program.
 void die(const char *msg);
+
+// Debug print midi data.
+void print_midi_event(const char *source, jack_midi_event_t e);
 
 int initialize_ports();
 int connect_ports();
@@ -39,6 +43,7 @@ unsigned char color(int g, int r);
 
 int handle_clk_event(jack_midi_event_t event, void *ndout, void *lpout);
 int handle_launchpad_event(jack_midi_event_t event, void *ndout, void *lpout);
+int handle_norddrum_event(jack_midi_event_t event, void *ndout, void *lpout);
 
 int handle_grid_button(jack_midi_event_t midi_event, void *ndout, void *lpout);
 int handle_live_trig(jack_midi_event_t midi_event, void *ndout, void *lpout);
@@ -70,18 +75,23 @@ unsigned char get_cell_from(int step); // Determine MIDI note number for the giv
 int reset_launchpad(void *lpout); // Takes a JACK port buffer.
 int update_launchpad(void *lpout); // Takes a JACK port buffer.
 
-unsigned char seqdata[6][64]; // Sequence data: 6 tracks x 64 steps.
+unsigned char ctrldata[6][64]; // Sequence data: 6 tracks x 64 steps.
+unsigned char trigdata[6][64]; // Sequence data: 6 tracks x 64 steps.
 int curr_track; // Last track that was selected.
 
 jack_client_t *client;
 jack_port_t *mclk_input; // receive jack_midi_clock data
 jack_port_t *launchpad_input; // receive Launchpad MIDI events
 jack_port_t *launchpad_output; // send MIDI data to the Launchpad
+jack_port_t *norddrum_input; // receive MIDI data from the Nord Drum
 jack_port_t *norddrum_output; // send MIDI data to the Nord Drum
+jack_ringbuffer_t *norddrum_events;
 jack_status_t status;
 
 int main() {
 	int rc = 0;
+
+	norddrum_events = jack_ringbuffer_create(16); // Arbitrary size.
 
 	// Create the client.
 	client = jack_client_open("ndtrig", JackNoStartServer, &status);
@@ -160,6 +170,12 @@ int initialize_ports() {
 		fprintf(stderr, "failed to register jack_midi_clock input port");
 		return 1;
 	}
+	// Register nord drum input port (receive data from nord drum).
+	norddrum_input = jack_port_register(client, "nord drum input", JACK_DEFAULT_MIDI_TYPE, JackPortIsInput, 0);
+	if (norddrum_input == NULL) {
+		fprintf(stderr, "failed to register nord drum input port");
+		return 1;
+	}
 	// Register nord drum output port (send data to nord drum).
 	norddrum_output = jack_port_register(client, "nord drum output", JACK_DEFAULT_MIDI_TYPE, JackPortIsOutput, 0);
 	if (norddrum_output == NULL) {
@@ -172,12 +188,11 @@ int initialize_ports() {
 int connect_ports() {
 	int rc = 0;
 	
-	/* const char *lpin = "a2j:Launchpad Mini [28] (playback): Launchpad Mini MIDI 1"; */
 	const char *lpin;
-	/* const char *lpout = "a2j:Launchpad Mini [28] (capture): Launchpad Mini MIDI 1"; */
 	const char *lpout;
-	const char *mclkout;// = "jack_midi_clock:mclk_out";
-	const char *scarlett;// = "a2j:Scarlett 6i6 USB [20] (playback): Scarlett 6i6 USB MIDI 1";
+	const char *mclkout;
+	const char *scarin;
+	const char *scarout;
 
 	// Discover jack inputs.
 	const char **jack_inputs = jack_get_ports(client, "", "", JackPortIsInput);
@@ -192,7 +207,7 @@ int connect_ports() {
 		if (lpss != NULL) {
 			lpin = *jack_inputs;
 		} else if (scss != NULL) {
-			scarlett = *jack_inputs;
+			scarin = *jack_inputs;
 		}
 		jack_inputs++;
 	}
@@ -206,11 +221,14 @@ int connect_ports() {
 	while (jack_outputs != NULL && *jack_outputs != NULL) {
 		char *lpss = strstr(*jack_outputs, "Launchpad Mini");
 		char *mclkss = strstr(*jack_outputs, "jack_midi_clock");
+		char *scss = strstr(*jack_outputs, "Scarlett 6i6"); // TODO: this should be a command-line flag.
 
  		if (lpss != NULL) {
 			lpout = *jack_outputs;
 		} else if (mclkss != NULL) {
 			mclkout = *jack_outputs;
+		} else if (scss != NULL) {
+			scarout = *jack_outputs;
 		}
 		jack_outputs++;
 	}
@@ -233,9 +251,16 @@ int connect_ports() {
 		fprintf(stderr, "Failed to connect to mclk output: %s\n", mclkout);
 		return rc;
 	}
-	rc = jack_connect(client, jack_port_name(norddrum_output), scarlett);
+	// Send MIDI to the nord drum.
+	rc = jack_connect(client, jack_port_name(norddrum_output), scarin);
 	if (rc != 0) {
-		fprintf(stderr, "Failed to connect to scarlett 6i6: %s\n", scarlett);
+		fprintf(stderr, "Failed to connect to scarlett 6i6 input: %s\n", scarin);
+		return rc;
+	}
+	// Receive MIDI from the nord drum.
+	rc = jack_connect(client, scarout, jack_port_name(norddrum_input));
+	if (rc != 0) {
+		fprintf(stderr, "Failed to connect to scarlett 6i6 output: %s\n", scarout);
 		return rc;
 	}
 	return 0;
@@ -250,8 +275,9 @@ int process(jack_nframes_t nframes, void *arg) {
 	int rc = 0;
 	
 	// Initialize the input buffers.
-	void *lpin = jack_port_get_buffer(launchpad_input, nframes);
 	void *clkin = jack_port_get_buffer(mclk_input, nframes);
+	void *lpin = jack_port_get_buffer(launchpad_input, nframes);
+	void *ndin = jack_port_get_buffer(norddrum_input, nframes);
 	
 	// Buffer for data we will send to the nord drum.
 	void *lpout = jack_port_get_buffer(launchpad_output, nframes);
@@ -262,10 +288,11 @@ int process(jack_nframes_t nframes, void *arg) {
 	jack_midi_clear_buffer(ndout);
 
 	// Process the input events.
-	jack_nframes_t nlp = jack_midi_get_event_count(lpin);
 	jack_nframes_t nclk = jack_midi_get_event_count(clkin);
+	jack_nframes_t nlp = jack_midi_get_event_count(lpin);
+	jack_nframes_t nnd = jack_midi_get_event_count(ndin);
 
-	if (nlp == 0 && nclk == 0) {
+	if (nclk == 0 && nlp == 0 && nnd == 0) {
 		// If we didn't get any events then clear the output bus(ses). Is this necessary?
 		rc = jack_midi_event_write(ndout, 0, NULL, 0);
 		if (rc != 0) {
@@ -293,7 +320,29 @@ int process(jack_nframes_t nframes, void *arg) {
 			return rc;
 		}
 	}
+	if (norddrum_events == NULL) {
+		fprintf(stderr, "allocating array of nord drum MIDI events");
+		return 1;
+	}
+	// Process the nord drum events.
+	// This will store MIDI CC data for the current step.
+	// If we handle the nord drum before the clk events this means that
+	// when recording controller data we should try to tweak the controller just ahead of the trigs.
+	for (jack_nframes_t i = 0; i < nnd; i++) {
+		jack_midi_event_t *midi_event = malloc(sizeof(jack_midi_event_t));
+
+		rc = jack_midi_event_get(midi_event, ndin, (uint32_t) i);
+		if (rc != 0) {
+			fprintf(stderr, "error getting nord drum MIDI event\n");
+			return rc;
+		}
+		if (jack_ringbuffer_write(norddrum_events, (const char *) midi_event, sizeof(jack_midi_event_t)) < sizeof(jack_midi_event_t)) {
+			fprintf(stderr, "wrote less bytes than expected to norddrum_events ringbuffer\n");
+			return 1;
+		}
+	}
 	// Process the clk events.
+	// This will move the sequencer's internal state forward!
 	for (jack_nframes_t i = 0; i < nclk; i++) {
 		jack_midi_event_t midi_event;
 		
@@ -315,14 +364,7 @@ int handle_launchpad_event(jack_midi_event_t midi_event, void *ndout, void *lpou
 	int rc = 0;
 
 	// Handy for looking at raw MIDI data.
-	/* for (size_t j = 0; j < midi_event.size; j++) { */
-	/* 	if (j == 0) { */
-	/* 		printf("%X", midi_event.buffer[j]); */
-	/* 	} else { */
-	/* 		printf(" %X", midi_event.buffer[j]); */
-	/* 	} */
-	/* } */
-	/* printf("\n"); */
+	print_midi_event("launchpad", midi_event);
 	
 	// We always expect at least 3 bytes.
 	if (midi_event.size < 3) {
@@ -333,7 +375,7 @@ int handle_launchpad_event(jack_midi_event_t midi_event, void *ndout, void *lpou
 	if (midi_event.buffer[0] == 0xB0) {
 		rc = handle_scene_button(midi_event, ndout, lpout);
 		if (rc != 0) {
-			fprintf(stderr, "error switch modes");
+			fprintf(stderr, "error switch modes\n");
 		}
 		return rc;
 	}
@@ -341,14 +383,14 @@ int handle_launchpad_event(jack_midi_event_t midi_event, void *ndout, void *lpou
 	if ((midi_event.buffer[1] & 0x08) == 8) {
 		rc = handle_letter_button(midi_event, ndout, lpout);
 		if (rc != 0) {
-			fprintf(stderr, "handle letter button");
+			fprintf(stderr, "handle letter button\n");
 		}
 		return rc;
 	}
 	/* printf(">>> grid button\n"); */
 	rc = handle_grid_button(midi_event, ndout, lpout);
 	if (rc != 0) {
-		fprintf(stderr, "handle grid button");
+		fprintf(stderr, "handle grid button\n");
 		return rc;
 	}
 	return 0;
@@ -368,14 +410,14 @@ int handle_grid_button(jack_midi_event_t midi_event, void *ndout, void *lpout) {
 		// Toggle the sequencer step for the current track.
 		rc = toggle_seq_step(midi_event, lpout);
 		if (rc != 0) {
-			fprintf(stderr, "toggling sequencer step");
+			fprintf(stderr, "toggling sequencer step\n");
 			return rc;
 		}
 		break;
 	case MODE_LIVE_TRIG:
 		rc = handle_live_trig(midi_event, ndout, lpout);
 		if (rc != 0) {
-			fprintf(stderr, "handle_grid_button handling live trig");
+			fprintf(stderr, "handle_grid_button handling live trig\n");
 			return rc;
 		}
 		break;
@@ -419,7 +461,7 @@ int handle_scene_button(jack_midi_event_t midi_event, void *ndout, void *lpout) 
 		}
 		rc = switch_mode(midi_event, ndout, lpout);
 		if (rc != 0) {
-			fprintf(stderr, "handle_scene_button switching mode");
+			fprintf(stderr, "handle_scene_button switching mode\n");
 			return rc;
 		}
 		break;
@@ -430,7 +472,7 @@ int handle_scene_button(jack_midi_event_t midi_event, void *ndout, void *lpout) 
 		// Switch tracks (doesn't do anything in live trig mode, but perhaps it should).
 		rc = handle_track_button(midi_event, ndout, lpout);
 		if (rc != 0) {
-			fprintf(stderr, "calling handle_track_button");
+			fprintf(stderr, "calling handle_track_button\n");
 			return rc;
 		}
 	}
@@ -451,19 +493,19 @@ int handle_track_button(jack_midi_event_t midi_event, void *ndout, void *lpout) 
 		}
 		rc = jack_midi_event_write(lpout, 0, e, 3);
 		if (rc != 0) {
-			fprintf(stderr, "handle_track_button updating track button");
+			fprintf(stderr, "handle_track_button updating track button\n");
 			return rc;
 		}
 	}
 	// Update the grid with the current track's sequencer data.
 	for (int i = 0; i < 64; i++) {
 		unsigned char e[3] = {0x90, get_cell_from(i), 0};
-		if (seqdata[curr_track][i]) {
+		if (trigdata[curr_track][i]) {
 			e[2] = color(3, 0);
 		}
 		rc = jack_midi_event_write(lpout, 0, e, 3);
 		if (rc != 0) {
-			fprintf(stderr, "handle_track_button updating grid button");
+			fprintf(stderr, "handle_track_button updating grid button\n");
 			return rc;
 		}
 	}
@@ -513,6 +555,11 @@ int handle_clk_event(jack_midi_event_t midi_event, void *ndout, void *lpout) {
 	return rc;
 }
 
+int handle_norddrum_event(jack_midi_event_t event, void *ndout, void *lpout) {
+	print_midi_event("nord drum", event);
+	return 0;
+}
+
 int start(void *ndout, void *lpout) {
 	curr = 0;
 	return play(curr, ndout, lpout);
@@ -537,10 +584,10 @@ int play(int step, void *ndout, void *lpout) {
 	// Play the tracks for the given step.
 	for (int i = 0; i < 6; i++) {
 		unsigned char ndevent[3] = {0x90+i, 60, 127};
-		if (seqdata[i][curr]) {
+		if (trigdata[i][curr]) {
 			rc = jack_midi_event_write(ndout, 0, ndevent, 3);
 			if (rc != 0) {
-				fprintf(stderr, "writing MIDI data to nord drum");
+				fprintf(stderr, "writing MIDI data to nord drum\n");
 				return rc;
 			}
 		}
@@ -555,6 +602,7 @@ int play(int step, void *ndout, void *lpout) {
 
 	rc = jack_midi_event_write(lpout, 0, lpevent, 3);
 	if (rc != 0) {
+		fprintf(stderr, "play: writing MIDI data to launchpad\n");
 		return rc;
 	}
 	if (curr == 0 && 0 == prev) {
@@ -564,13 +612,13 @@ int play(int step, void *ndout, void *lpout) {
 			unsigned char e[3] = {0x80, cell(i), 0};
 			rc = jack_midi_event_write(lpout, 0, e, 8);
 			if (rc != 0) {
-				fprintf(stderr, "error turning off launchpad button");
+				fprintf(stderr, "play: error turning off launchpad button\n");
 				return rc;
 			}
 		}
 	} else {
 		unsigned char prev_color = 0;
-		if (seqdata[curr_track][prev]) {
+		if (trigdata[curr_track][prev]) {
 			prev_color = color(3, 0);
 		}
 		// Turn off prev.
@@ -578,7 +626,7 @@ int play(int step, void *ndout, void *lpout) {
 		unsigned char e[3] = {0x90, cell(prev), prev_color};
 		rc = jack_midi_event_write(lpout, 0, e, 8);
 		if (rc != 0) {
-			fprintf(stderr, "error turning off launchpad button");
+			fprintf(stderr, "error turning off launchpad button\n");
 			return rc;
 		}
 	}
@@ -603,7 +651,7 @@ int reset_launchpad(void *lpout) {
 	
 	rc = jack_midi_event_write(lpout, 0, lpevent, 3);
 	if (rc != 0) {
-		fprintf(stderr, "resetting launchpad");
+		fprintf(stderr, "resetting launchpad\n");
 		return rc;
 	}
 	return 0;
@@ -622,7 +670,7 @@ int update_launchpad(void *lpout) {
 			unsigned char e[3] = {0x90, get_cell_from(i), 0};
 			rc = jack_midi_event_write(lpout, 0, e, 3);
 			if (rc != 0) {
-				fprintf(stderr, "update_launchpad turning grid button off");
+				fprintf(stderr, "update_launchpad turning grid button off\n");
 				return rc;
 			}
 		}
@@ -631,7 +679,7 @@ int update_launchpad(void *lpout) {
 			unsigned char e[3] = {0xB0, 104+i, 0};
 			rc = jack_midi_event_write(lpout, 0, e, 3);
 			if (rc != 0) {
-				fprintf(stderr, "update_launchpad turning track button off");
+				fprintf(stderr, "update_launchpad turning track button off\n");
 				return rc;
 			}
 		}
@@ -641,13 +689,13 @@ int update_launchpad(void *lpout) {
 		// If we're in sequencer mode then scene buttons 1-6 indicate the currently selected sequencer track.
 		rc = set_track_leds(lpout);
 		if (rc != 0) {
-			fprintf(stderr, "update_launchpad set track LED's");
+			fprintf(stderr, "update_launchpad set track LED's\n");
 			return rc;
 		}
 		// Set the grid based on the sequencer data of the current track.
 		rc = set_grid_leds(lpout);
 		if (rc != 0) {
-			fprintf(stderr, "update_launchpad setting grid");
+			fprintf(stderr, "update_launchpad setting grid\n");
 			return rc;
 		}
 		lpevent[2] = color(3, 3); // g, r
@@ -655,7 +703,7 @@ int update_launchpad(void *lpout) {
 	}
 	rc = jack_midi_event_write(lpout, 0, lpevent, 3);
 	if (rc != 0) {
-		fprintf(stderr, "updating launchpad button");
+		fprintf(stderr, "updating launchpad button\n");
 		return rc;
 	}
 	return 0;
@@ -668,7 +716,7 @@ int initialize_seq(void *lpout) {
 	// Initialize sequencer data to be all zeroes.
 	for (int i = 0; i < 6; i++) {
 		for (int j = 0; j < 64; j++) {
-			seqdata[i][j] = 0;
+			trigdata[i][j] = 0;
 		}
 	}
 
@@ -680,7 +728,7 @@ int initialize_seq(void *lpout) {
 	
 	rc = update_launchpad(lpout);
 	if (rc != 0) {
-		fprintf(stderr, "error updating launchpad");
+		fprintf(stderr, "error updating launchpad\n");
 		return rc;
 	}
 	return 0;
@@ -702,19 +750,19 @@ unsigned char get_cell_from(int step) {
 int toggle_seq_step(jack_midi_event_t midi_event, void *lpout) {
 	int rc = 0;
 	int step = get_step_from(midi_event);
-	int val = seqdata[curr_track][step];
+	int val = trigdata[curr_track][step];
 
 	// Set the internal state of the sequencer.
-	seqdata[curr_track][step] = !val;
+	trigdata[curr_track][step] = !val;
 
 	unsigned char e[3] = {midi_event.buffer[0], midi_event.buffer[1], color(0, 0)};
 
-	if (seqdata[curr_track][step]) {
+	if (trigdata[curr_track][step]) {
 		e[2] = color(3, 0);
 	}
 	rc = jack_midi_event_write(lpout, 0, e, 3);
 	if (rc != 0) {
-		fprintf(stderr, "toggling sequencer step");
+		fprintf(stderr, "toggling sequencer step\n");
 		return rc;
 	}
 	return 0;
@@ -725,12 +773,12 @@ int set_grid_leds(void *lpout) {
 	
 	for (int i = 0; i < 64; i++) {
 		unsigned char e[3] = {0x90, get_cell_from(i), 0};
-		if (seqdata[curr_track][i]) {
+		if (trigdata[curr_track][i]) {
 			e[2] = color(3, 0);
 		}
 		rc = jack_midi_event_write(lpout, 0, e, 3);
 		if (rc != 0) {
-			fprintf(stderr, "set_grid_leds sending MIDI data to launchpad");
+			fprintf(stderr, "set_grid_leds sending MIDI data to launchpad\n");
 			return rc;
 		}
 	}
@@ -749,7 +797,7 @@ int set_track_leds(void *lpout) {
 		}
 		rc = jack_midi_event_write(lpout, 0, lpevent, 3);
 		if (rc != 0) {
-			fprintf(stderr, "setting track LED %d", i);
+			fprintf(stderr, "setting track LED %d\n", i);
 			return rc;
 		}
 	}
@@ -770,7 +818,7 @@ int switch_mode(jack_midi_event_t midi_event, void *ndout, void *lpout) {
 	}
 	rc = update_launchpad(lpout);
 	if (rc != 0) {
-		fprintf(stderr, "switch_mode updating launchpad");
+		fprintf(stderr, "switch_mode updating launchpad\n");
 		return rc;
 	}
 	return 0;
@@ -782,4 +830,12 @@ inline unsigned char cell(int step) {
 
 inline unsigned char color(int g, int r) {
 	return (unsigned char) (g * 16) + r;
+}
+
+void print_midi_event(const char *source, jack_midi_event_t e) {
+	printf("%s:", source);
+	for (size_t j = 0; j < e.size; j++) {
+		printf(" %X", e.buffer[j]);
+	}
+	printf("\n");
 }
