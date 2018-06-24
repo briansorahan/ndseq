@@ -91,7 +91,7 @@ jack_status_t status;
 int main() {
 	int rc = 0;
 
-	norddrum_events = jack_ringbuffer_create(16); // Arbitrary size.
+	norddrum_events = jack_ringbuffer_create(64 * sizeof(jack_midi_event_t)); // Arbitrary size.
 
 	// Create the client.
 	client = jack_client_open("ndtrig", JackNoStartServer, &status);
@@ -336,7 +336,9 @@ int process(jack_nframes_t nframes, void *arg) {
 			fprintf(stderr, "error getting nord drum MIDI event\n");
 			return rc;
 		}
-		if (jack_ringbuffer_write(norddrum_events, (const char *) midi_event, sizeof(jack_midi_event_t)) < sizeof(jack_midi_event_t)) {
+		size_t written = jack_ringbuffer_write(norddrum_events, (void *) midi_event, sizeof(jack_midi_event_t));
+		
+		if (written < sizeof(jack_midi_event_t)) {
 			fprintf(stderr, "wrote less bytes than expected to norddrum_events ringbuffer\n");
 			return 1;
 		}
@@ -551,6 +553,16 @@ int handle_clk_event(jack_midi_event_t midi_event, void *ndout, void *lpout) {
 	/* 		printf(" %X", midi_event.buffer[j]); */
 	/* 	} */
 	/* 	printf("\n"); */
+	}
+	// Process queued nord drum events.
+	while (jack_ringbuffer_read_space(norddrum_events) >= sizeof(jack_midi_event_t)) {
+		jack_midi_event_t *ndevent = malloc(sizeof(jack_midi_event_t));
+		size_t bytes_read = jack_ringbuffer_read(norddrum_events, (char *) ndevent, sizeof(jack_midi_event_t));
+		if (bytes_read < sizeof(jack_midi_event_t)) {
+			fprintf(stderr, "handle_clk_event reading nord drum MIDI event: expected to read %ld bytes, actually read %ld\n", sizeof(jack_midi_event_t), bytes_read);
+			return 1;
+		}
+		free(ndevent);
 	}
 	return rc;
 }
