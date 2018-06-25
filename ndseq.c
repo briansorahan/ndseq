@@ -328,21 +328,21 @@ int process(jack_nframes_t nframes, void *arg) {
 	// This will store MIDI CC data for the current step.
 	// If we handle the nord drum before the clk events this means that
 	// when recording controller data we should try to tweak the controller just ahead of the trigs.
-	for (jack_nframes_t i = 0; i < nnd; i++) {
-		jack_midi_event_t *midi_event = malloc(sizeof(jack_midi_event_t));
+	/* for (jack_nframes_t i = 0; i < nnd; i++) { */
+	/* 	jack_midi_event_t *midi_event = malloc(sizeof(jack_midi_event_t)); */
 
-		rc = jack_midi_event_get(midi_event, ndin, (uint32_t) i);
-		if (rc != 0) {
-			fprintf(stderr, "error getting nord drum MIDI event\n");
-			return rc;
-		}
-		size_t written = jack_ringbuffer_write(norddrum_events, (void *) midi_event, sizeof(jack_midi_event_t));
+	/* 	rc = jack_midi_event_get(midi_event, ndin, (uint32_t) i); */
+	/* 	if (rc != 0) { */
+	/* 		fprintf(stderr, "error getting nord drum MIDI event\n"); */
+	/* 		return rc; */
+	/* 	} */
+	/* 	size_t written = jack_ringbuffer_write(norddrum_events, (void *) midi_event, sizeof(jack_midi_event_t)); */
 		
-		if (written < sizeof(jack_midi_event_t)) {
-			fprintf(stderr, "wrote less bytes than expected to norddrum_events ringbuffer\n");
-			return 1;
-		}
-	}
+	/* 	if (written < sizeof(jack_midi_event_t)) { */
+	/* 		fprintf(stderr, "wrote less bytes than expected to norddrum_events ringbuffer\n"); */
+	/* 		return 1; */
+	/* 	} */
+	/* } */
 	// Process the clk events.
 	// This will move the sequencer's internal state forward!
 	for (jack_nframes_t i = 0; i < nclk; i++) {
@@ -366,7 +366,7 @@ int handle_launchpad_event(jack_midi_event_t midi_event, void *ndout, void *lpou
 	int rc = 0;
 
 	// Handy for looking at raw MIDI data.
-	print_midi_event("launchpad", midi_event);
+	/* print_midi_event("launchpad", midi_event); */
 	
 	// We always expect at least 3 bytes.
 	if (midi_event.size < 3) {
@@ -429,7 +429,7 @@ int handle_grid_button(jack_midi_event_t midi_event, void *ndout, void *lpout) {
 int handle_live_trig(jack_midi_event_t midi_event, void *ndout, void *lpout) {
 	int rc = 0;
 
-	printf(">>> handle_live_trig track = %d, velocity = %d\n", (midi_event.buffer[1] % 8)+1, (112 - (midi_event.buffer[1] & 0xF0)) + 15);
+	/* printf(">>> handle_live_trig track = %d, velocity = %d\n", (midi_event.buffer[1] % 8)+1, (112 - (midi_event.buffer[1] & 0xF0)) + 15); */
 	
 	unsigned char ndevent[3] = {midi_event.buffer[0] + (midi_event.buffer[1] % 8), 60, (112 - (midi_event.buffer[1] & 0xF0)) + 15};
 	unsigned char lpevent[3] = {midi_event.buffer[0], midi_event.buffer[1], color(3, 0)};
